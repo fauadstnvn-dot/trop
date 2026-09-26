@@ -1,0 +1,4 @@
+requests>=2.31
+beautifulsoup4>=4.12
+Pillow>=10.0
+PyMySQL>=1.1
