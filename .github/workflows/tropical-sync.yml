@@ -1,0 +1,92 @@
+name: Tropical Tidbits Daily Sync
+
+on:
+  schedule:
+    # Chạy 1 lần/ngày lúc 01:00 UTC = 08:00 giờ Việt Nam (GMT+7)
+    - cron: "0 1,13 * * *"
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Danh sách model (phân cách bằng dấu phẩy)"
+        required: false
+        default: "gfs,ecmwf,jma,ec-aifs,icon,gem"
+      pkg_filter:
+        description: "Chỉ chạy các pkg này (để trống = TẤT CẢ pkg)"
+        required: false
+        default: ""
+      threads:
+        description: "Số luồng tải song song"
+        required: false
+        default: "8"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tropical-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync script
+        env:
+          MODELS: ${{ github.event.inputs.models || vars.MODELS || 'gfs,ecmwf,jma,ec-aifs,icon,gem' }}
+          PKG_FILTER: ${{ github.event.inputs.pkg_filter || vars.PKG_FILTER }}
+          THREADS: ${{ github.event.inputs.threads || vars.THREADS || '8' }}
+          REGION: ${{ vars.REGION || 'wpac' }}
+          # MySQL (tùy chọn) - để trống sẽ dùng state.json
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          # FTP (tùy chọn) - upload ảnh lên hosting
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_PORT: ${{ secrets.FTP_PORT }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_DIR: ${{ secrets.FTP_DIR }}
+          FTP_TLS: ${{ secrets.FTP_TLS }}
+        run: python tropical_sync.py
+
+      - name: Commit state / images back to repo
+        if: always()
+        env:
+          SAVE_IMAGES_TO_REPO: ${{ vars.SAVE_IMAGES_TO_REPO || 'false' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898183+github-actions[bot]@users.noreply.github.com"
+          [ -f state.json ] && git add state.json
+          if [ "$SAVE_IMAGES_TO_REPO" = "true" ]; then git add -A imgtrop; fi
+          if git diff --cached --quiet; then
+            echo "Không có thay đổi để commit."
+          else
+            git commit -m "Auto sync $(TZ=Asia/Ho_Chi_Minh date '+%Y-%m-%d %H:%M') GMT+7"
+            git pull --rebase --autostash || true
+            git push
+          fi
+
+      - name: Upload images as artifact
+        if: always() && vars.UPLOAD_ARTIFACT == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgtrop-${{ github.run_number }}
+          path: imgtrop/
+          retention-days: 3
+          if-no-files-found: ignore
