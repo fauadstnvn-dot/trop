@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue as queue_mod
 import re
 import sys
 import threading
@@ -79,6 +80,9 @@ FTP_USER = env("FTP_USER")
 FTP_PASS = env("FTP_PASS")
 FTP_DIR = env("FTP_DIR", "/public_html/imgtrop")
 FTP_TLS_ON = env("FTP_TLS", "false").lower() == "true"
+FTP_MAX_CONN = max(1, int(env("FTP_MAX_CONN", "3")))
+FTP_RETRIES = max(1, int(env("FTP_RETRIES", "4")))
+PKG_DELAY = float(env("PKG_DELAY", "2"))
 
 # -------------------------------------------------------------------------
 # LOG
@@ -278,36 +282,74 @@ class JsonStore:
 
 
 # -------------------------------------------------------------------------
-# FTP (tùy chọn) - mỗi luồng giữ 1 kết nối riêng
+# FTP (tùy chọn) - dùng chung 1 "hồ" kết nối cố định (FTP_MAX_CONN) cho mọi luồng,
+# để không bao giờ vượt giới hạn số kết nối/IP của hosting (lỗi 421).
 # -------------------------------------------------------------------------
 class FtpUploader:
     def __init__(self) -> None:
-        self.local = threading.local()
         self.enabled = bool(FTP_HOST and FTP_USER)
+        self.pool: queue_mod.Queue = queue_mod.Queue()
+        self.slots = threading.Semaphore(FTP_MAX_CONN)
+        self.all_conns: list = []
+        self.lock = threading.Lock()
         if self.enabled:
             ftp = self._connect()
             self._ensure_dir(ftp, FTP_DIR)
-            log(f"Đã kết nối FTP {FTP_HOST} -> thư mục {FTP_DIR}", "success")
+            self.pool.put(ftp)
+            log(f"Đã kết nối FTP {FTP_HOST} -> thư mục {FTP_DIR} (tối đa {FTP_MAX_CONN} kết nối)", "success")
 
     def _connect(self):
-        ftp = FTP_TLS() if FTP_TLS_ON else FTP()
-        ftp.connect(FTP_HOST, FTP_PORT, timeout=60)
-        ftp.login(FTP_USER, FTP_PASS)
-        if FTP_TLS_ON:
-            ftp.prot_p()
-        ftp.set_pasv(True)
-        self.local.ftp = ftp
-        return ftp
+        for attempt in range(FTP_RETRIES):
+            try:
+                ftp = FTP_TLS() if FTP_TLS_ON else FTP()
+                ftp.connect(FTP_HOST, FTP_PORT, timeout=60)
+                ftp.login(FTP_USER, FTP_PASS)
+                if FTP_TLS_ON:
+                    ftp.prot_p()
+                ftp.set_pasv(True)
+                with self.lock:
+                    self.all_conns.append(ftp)
+                return ftp
+            except Exception as exc:
+                if "421" in str(exc) and attempt < FTP_RETRIES - 1:
+                    wait = 5 * (attempt + 1)
+                    log(f"    FTP báo quá nhiều kết nối, chờ {wait}s rồi thử lại...", "system")
+                    time.sleep(wait)
+                    continue
+                raise
 
-    def _get(self):
-        ftp = getattr(self.local, "ftp", None)
-        if ftp is None:
-            return self._connect()
+    def _acquire(self):
+        self.slots.acquire()
+        try:
+            ftp = self.pool.get_nowait()
+        except queue_mod.Empty:
+            return self._connect_or_release()
         try:
             ftp.voidcmd("NOOP")
             return ftp
         except Exception:
+            self._drop(ftp)
+            return self._connect_or_release()
+
+    def _connect_or_release(self):
+        try:
             return self._connect()
+        except Exception:
+            self.slots.release()
+            raise
+
+    def _release(self, ftp) -> None:
+        self.pool.put(ftp)
+        self.slots.release()
+
+    def _drop(self, ftp) -> None:
+        try:
+            ftp.close()
+        except Exception:
+            pass
+        with self.lock:
+            if ftp in self.all_conns:
+                self.all_conns.remove(ftp)
 
     @staticmethod
     def _ensure_dir(ftp, path: str) -> None:
@@ -320,29 +362,45 @@ class FtpUploader:
                 pass
 
     def upload(self, name: str, data: bytes) -> None:
-        for attempt in range(2):
+        for attempt in range(FTP_RETRIES):
+            ftp = self._acquire()
             try:
-                ftp = self._get()
                 ftp.storbinary(f"STOR {FTP_DIR.rstrip('/')}/{name}", io.BytesIO(data))
+                self._release(ftp)
                 return
             except Exception:
-                self.local.ftp = None
-                if attempt == 1:
+                self._drop(ftp)
+                self.slots.release()
+                if attempt == FTP_RETRIES - 1:
                     raise
+                time.sleep(3 * (attempt + 1))
 
     def delete(self, name: str) -> None:
         try:
-            self._get().delete(f"{FTP_DIR.rstrip('/')}/{name}")
+            ftp = self._acquire()
         except Exception:
-            pass
+            return
+        try:
+            ftp.delete(f"{FTP_DIR.rstrip('/')}/{name}")
+            self._release(ftp)
+        except error_perm:
+            self._release(ftp)
+        except Exception:
+            self._drop(ftp)
+            self.slots.release()
 
     def close(self) -> None:
-        ftp = getattr(self.local, "ftp", None)
-        if ftp:
+        with self.lock:
+            conns = list(self.all_conns)
+            self.all_conns.clear()
+        for ftp in conns:
             try:
                 ftp.quit()
             except Exception:
-                pass
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
 
 
 # -------------------------------------------------------------------------
@@ -551,7 +609,7 @@ def main() -> int:
                 except Exception as exc:
                     stats["fail"] += 1
                     log(f"  => LỖI không mong muốn ở [{model} - {p['pkg']}]: {exc}", "error")
-                time.sleep(0.5)
+                time.sleep(PKG_DELAY)
     finally:
         store.close()
         ftp.close()
