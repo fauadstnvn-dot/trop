@@ -80,9 +80,10 @@ FTP_USER = env("FTP_USER")
 FTP_PASS = env("FTP_PASS")
 FTP_DIR = env("FTP_DIR", "/public_html/imgtrop")
 FTP_TLS_ON = env("FTP_TLS", "false").lower() == "true"
-FTP_MAX_CONN = max(1, int(env("FTP_MAX_CONN", "3")))
+FTP_MAX_CONN = max(1, int(env("FTP_MAX_CONN", "5")))
 FTP_RETRIES = max(1, int(env("FTP_RETRIES", "4")))
-PKG_DELAY = float(env("PKG_DELAY", "2"))
+PKG_DELAY = float(env("PKG_DELAY", "0.5"))
+MAX_PENDING_UPLOADS = max(1, int(env("MAX_PENDING_UPLOADS", "300")))
 
 # -------------------------------------------------------------------------
 # LOG
@@ -365,7 +366,7 @@ class FtpUploader:
         for attempt in range(FTP_RETRIES):
             ftp = self._acquire()
             try:
-                ftp.storbinary(f"STOR {FTP_DIR.rstrip('/')}/{name}", io.BytesIO(data))
+                ftp.storbinary(f"STOR {FTP_DIR.rstrip('/')}/{name}", io.BytesIO(data), blocksize=262144)
                 self._release(ftp)
                 return
             except Exception:
@@ -476,30 +477,92 @@ def get_pkgs(model: str, store) -> list[dict]:
 # -------------------------------------------------------------------------
 # BƯỚC 2: TẢI ẢNH CHO 1 PKG
 # -------------------------------------------------------------------------
-def download_one(item: dict, ftp: FtpUploader) -> tuple[bool, str]:
+def download_one(item: dict) -> tuple[bytes | None, str]:
     try:
         resp = SESSION.get(item["url"], headers={"Referer": item["referer"]}, timeout=60)
         if resp.status_code != 200 or not resp.content:
-            return False, f"LỖI HTTP {resp.status_code}: {item['name']}"
+            return None, f"LỖI HTTP {resp.status_code}: {item['name']}"
         jpg = process_image(resp.content)
     except Exception as exc:
-        return False, f"LỖI xử lý {item['name']}: {exc}"
+        return None, f"LỖI xử lý {item['name']}: {exc}"
 
     if KEEP_LOCAL:
         (SAVE_DIR / item["name"]).write_bytes(jpg)
-    if ftp.enabled:
+    return jpg, f"Tải & xử lý JPG OK -> {item['name']} ({len(jpg) / 1024:.2f} KB)"
+
+
+class Uploader:
+    """Đẩy ảnh lên FTP ở nền, để luồng tải có thể chuyển ngay sang pkg tiếp theo."""
+
+    def __init__(self, ftp: FtpUploader) -> None:
+        self.ftp = ftp
+        self.pool = ThreadPoolExecutor(max_workers=FTP_MAX_CONN) if ftp.enabled else None
+        # Giới hạn số ảnh đang chờ upload trong RAM
+        self.inflight = threading.Semaphore(MAX_PENDING_UPLOADS)
+
+    def submit(self, name: str, jpg: bytes):
+        if self.pool is None:
+            return None
+        self.inflight.acquire()
+        fut = self.pool.submit(self._upload, name, jpg)
+        fut.add_done_callback(lambda _f: self.inflight.release())
+        return fut
+
+    def _upload(self, name: str, jpg: bytes) -> tuple[bool, str]:
         try:
-            ftp.upload(item["name"], jpg)
+            self.ftp.upload(name, jpg)
+            return True, ""
         except Exception as exc:
-            return False, f"LỖI FTP {item['name']}: {exc}"
-    return True, f"Ghi đè & Lưu JPG OK -> {item['name']} ({len(jpg) / 1024:.2f} KB)"
+            return False, f"LỖI FTP {name}: {exc}"
+
+    def shutdown(self) -> None:
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
 
 
-def sync_pkg(model: str, pkg: str, store, ftp: FtpUploader, stats: dict) -> None:
+class PkgJob:
+    def __init__(self, model: str, pkg: str, model_id: int, queue: list[dict]) -> None:
+        self.model = model
+        self.pkg = pkg
+        self.model_id = model_id
+        self.queue = queue
+        self.results: dict[str, object] = {}
+
+    def ready(self) -> bool:
+        return all(r is None or r is True or r.done() for r in self.results.values())
+
+
+def finalize_job(job: PkgJob, store, stats: dict) -> None:
+    ok_count = 0
+    for item in job.queue:
+        res = job.results.get(item["name"])
+        if res is None:
+            continue
+        if res is not True:
+            ok, msg = res.result()
+            if not ok:
+                stats["fail"] += 1
+                log(f"    {msg}", "error")
+                continue
+        store.add_image(job.model_id, item["name"], item["runtime"])
+        stats["success"] += 1
+        ok_count += 1
+    ts = store.touch(job.model_id)
+    log(f"  => [{job.model}/{job.pkg}] Hoàn tất {ok_count}/{len(job.queue)} ảnh. Cập nhật: {ts} (GMT+7)", "info")
+
+
+def flush_jobs(pending: list[PkgJob], store, stats: dict, wait: bool = False) -> None:
+    for job in list(pending):
+        if wait or job.ready():
+            finalize_job(job, store, stats)
+            pending.remove(job)
+
+
+def sync_pkg(model: str, pkg: str, store, ftp: FtpUploader, uploader: Uploader, stats: dict) -> PkgJob | None:
     model_id = store.get_model_id(model, pkg)
     if model_id is None:
         log(f"  => LỖI: Không tìm thấy [{model} - {pkg}] trong dữ liệu.", "error")
-        return
+        return None
 
     target_url = f"{BASE_URL}?model={model}&region={REGION}&pkg={pkg}"
     log(f"Đang truy cập Model [{model}] - Pkg [{pkg}]...", "system")
@@ -511,7 +574,7 @@ def sync_pkg(model: str, pkg: str, store, ftp: FtpUploader, stats: dict) -> None
         img_paths = re.findall(r"'([^']+)'", block.group(1))
     if not img_paths:
         log(f"  => LỖI: Không tìm thấy ảnh cho pkg [{pkg}]. Bỏ qua.", "error")
-        return
+        return None
 
     queue: list[dict] = []
     for rel in img_paths:
@@ -527,7 +590,7 @@ def sync_pkg(model: str, pkg: str, store, ftp: FtpUploader, stats: dict) -> None
         ts = store.touch(model_id)
         log(f"  => ĐÃ CẬP NHẬT: Pkg [{pkg}] đã mới nhất ({len(new_names)} ảnh). Bỏ qua. [{ts} GMT+7]", "success")
         stats["skipped"] += 1
-        return
+        return None
 
     prefix = f"{model}_{pkg}_"
     local_files = {p.name for p in SAVE_DIR.glob(f"{prefix}*")} if SAVE_DIR.exists() else set()
@@ -542,29 +605,22 @@ def sync_pkg(model: str, pkg: str, store, ftp: FtpUploader, stats: dict) -> None
 
     total = len(queue)
     log(f"  => Tải & ghi đè toàn bộ: {total} ảnh với {THREADS} luồng...", "info")
+    job = PkgJob(model, pkg, model_id, queue)
     done = 0
-    succeeded: set[str] = set()
     with ThreadPoolExecutor(max_workers=THREADS) as pool:
-        futures = {pool.submit(download_one, item, ftp): item["name"] for item in queue}
+        futures = {pool.submit(download_one, item): item["name"] for item in queue}
         for fut in as_completed(futures):
             name = futures[fut]
-            ok, msg = fut.result()
+            jpg, msg = fut.result()
             done += 1
-            if ok:
-                succeeded.add(name)
-                stats["success"] += 1
-                log(f"    [{done}/{total}] {msg}", "success")
-            else:
+            if jpg is None:
                 stats["fail"] += 1
                 log(f"    [{done}/{total}] {msg}", "error")
-
-    # Ghi theo đúng thứ tự trên web để lần sau so sánh "ảnh đầu tiên" chính xác
-    for item in queue:
-        if item["name"] in succeeded:
-            store.add_image(model_id, item["name"], item["runtime"])
-
-    ts = store.touch(model_id)
-    log(f"  => Đã cập nhật thời gian: {ts} (GMT+7)", "info")
+                continue
+            log(f"    [{done}/{total}] {msg}", "success")
+            upload_future = uploader.submit(name, jpg)
+            job.results[name] = upload_future if upload_future is not None else True
+    return job
 
 
 # -------------------------------------------------------------------------
@@ -593,6 +649,8 @@ def main() -> int:
         log(f"Không tìm thấy {WATERMARK_FILE.name}: ảnh sẽ không được đóng dấu.", "system")
 
     stats = {"success": 0, "fail": 0, "deleted": 0, "skipped": 0, "pkgs": 0}
+    uploader = Uploader(ftp)
+    pending: list[PkgJob] = []
     try:
         for model in MODELS:
             log("", "info")
@@ -605,12 +663,23 @@ def main() -> int:
             for p in pkgs:
                 stats["pkgs"] += 1
                 try:
-                    sync_pkg(model, p["pkg"], store, ftp, stats)
+                    job = sync_pkg(model, p["pkg"], store, ftp, uploader, stats)
                 except Exception as exc:
+                    job = None
                     stats["fail"] += 1
                     log(f"  => LỖI không mong muốn ở [{model} - {p['pkg']}]: {exc}", "error")
-                time.sleep(PKG_DELAY)
+                if job is not None:
+                    pending.append(job)
+                    if PKG_DELAY > 0:
+                        time.sleep(PKG_DELAY)
+                flush_jobs(pending, store, stats)
+
+        if pending:
+            log(f"Đang chờ đẩy nốt ảnh lên FTP cho {len(pending)} pkg...", "system")
+        uploader.shutdown()
+        flush_jobs(pending, store, stats, wait=True)
     finally:
+        uploader.shutdown()
         store.close()
         ftp.close()
 
