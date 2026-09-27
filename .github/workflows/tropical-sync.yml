@@ -3,7 +3,7 @@ name: Tropical Tidbits Daily Sync
 on:
   schedule:
     # Chạy 1 lần/ngày lúc 01:00 UTC = 08:00 giờ Việt Nam (GMT+7)
-    # - cron: "0 1,13 * * *"
+     - cron: "0 1,13 * * *"
   workflow_dispatch:
     inputs:
       models:
